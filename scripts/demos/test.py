@@ -62,6 +62,7 @@ class G1TurningCollector:
         RL_LIBRARY = "rsl_rl"
         self.collect_data = collect_data
         self.waypoint = np.array(waypoint)
+        
 
         # --- RL config & checkpoint ---
         agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(TASK, args_cli)
@@ -74,8 +75,12 @@ class G1TurningCollector:
         env_cfg.curriculum = None
         env_cfg.scene.robot.init_state.rot = (0.0, 0.0, 0.0, 1.0) 
 
+        # --- Add Obstacle if you want ---
+        self._add_obstacle_cube(env_cfg, pos=(0.0, 3.0, 0.25), size=(0.5, 1.0, 0.5),index=0)
+        #self._add_blue_bin(env_cfg, pos=(4, 0, 0.25),index=0)
+        self._add_table(env_cfg, pos=(4, 0, 0.25),index=0)
         
-        self._add_obstacle_cube(env_cfg, pos=(2.0, 1.0, 0.25), size=(0.5, 1.0, 0.5),index=0)
+        # --- Add Obstacle if you want ---
         
         
         
@@ -114,10 +119,10 @@ class G1TurningCollector:
             ray_alignment="yaw",
 
             pattern_cfg=patterns.LidarPatternCfg(
-                channels=32,                      # 垂直线数（先别太大）
+                channels=32,                     
                 vertical_fov_range=(-90, 90),
                 horizontal_fov_range=(-180, 180),
-                horizontal_res=2.0,              # 分辨率（deg）
+                horizontal_res=2.0,              
             ),
 
             debug_vis=False,
@@ -174,7 +179,7 @@ class G1TurningCollector:
         stage = omni.usd.get_context().get_stage()
 
         scene_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../scene/scene.usd")
+            os.path.join(os.path.dirname(__file__), "../../scene_new/lab.usda")
         )
 
         prim_path = "/World/ExternalScene"
@@ -186,12 +191,13 @@ class G1TurningCollector:
         prim = stage.DefinePrim(prim_path, "Xform")
         prim.GetReferences().AddReference(scene_path)
 
-        # ---------- 控制scene transform ----------
+        # ---------- control scene transform ----------
         xform = UsdGeom.Xformable(prim)
 
-        xform.AddTranslateOp().Set(Gf.Vec3f(2, -1, 0))
-        xform.AddRotateZOp().Set(16)     
+        xform.AddTranslateOp().Set(Gf.Vec3f(2, -1, 1.85)) # 2 ，-1
+        xform.AddRotateZOp().Set(50)     
         xform.AddScaleOp().Set(Gf.Vec3f(1, 1, 1))
+        print(xform.GetLocalTransformation())
         # -----------------------------------------
 
         print("[INFO] Scene loaded")
@@ -238,8 +244,107 @@ class G1TurningCollector:
         )
 
         print(f"[INFO] Added {name} at {pos}")
+
+    def _add_blue_bin(self, env_cfg, pos, index):
+
+        import isaaclab.sim as sim_utils
+        from isaaclab.assets import RigidObjectCfg
+
+        name = f"blue_bin_{index}"
+
+        usd_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../scene_new/blue_bin1.usdz")
+        )
+
+        setattr(
+            env_cfg.scene,
+            name,
+            RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/{name}",
+
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=usd_path,
+
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=True   
+                    ),
+
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        collision_enabled=True
+                    ),
+
+                    scale=(0.75, 0.75, 0.75),
+                ),
+
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=pos,
+                    rot = (0.707, 0, 0, 0.707)  # quaternion (w,x,y,z)
+                ),
+            )
+        )
+
+        print(f"[INFO] Added blue bin at {pos}")
+
+    def _add_table(self, env_cfg, pos, index):
+
+        import isaaclab.sim as sim_utils
+        from isaaclab.assets import RigidObjectCfg
+
+        name = f"table_{index}"
+
+        usd_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../scene_new/table1.usdz")
+        )
+
+        setattr(
+            env_cfg.scene,
+            name,
+            RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/{name}",
+
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=usd_path,
+
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=True   
+                    ),
+
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        collision_enabled=True
+                    ),
+
+                    scale=(1, 1, 1),
+                ),
+
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=pos,
+                    rot = (1, 0, 0, 0)  # quaternion (w,x,y,z)
+                ),
+            )
+        )
+
+        print(f"[INFO] Added blue bin at {pos}")
     
 
+    def generate_random_waypoints(self):
+
+        # regions
+        R1 = (4.0,  1)
+        R2 = (4.0, -1)
+        R3 = (5.0,  0.0)
+        radius = 0.3
+
+        # randomly choose R1 or R2
+        if np.random.rand() < 0.5:
+            first_center = R1
+        else:
+            first_center = R2
+
+        # sample points
+        wp1 = self.sample_point_in_circle(first_center, radius)
+        wp2 = self.sample_point_in_circle(R3, radius)
+
+        return [wp1, wp2]
 
 
     def _add_waypoint_marker(self):
@@ -266,6 +371,14 @@ class G1TurningCollector:
         print(f"[INFO] Added {len(waypoints)} waypoint markers.")
 
 
+    def sample_point_in_circle(self, center, radius):
+        r = radius * np.sqrt(np.random.rand())
+        theta = 2 * np.pi * np.random.rand()
+        x = center[0] + r * np.cos(theta)
+        y = center[1] + r * np.sin(theta)
+        return np.array([x, y])
+
+
     def quat_to_yaw(self, quat):
         w, x, y, z = quat  
         #print(f"x:{x},y:{y},z:{z},w:{w}")
@@ -287,12 +400,31 @@ class G1TurningCollector:
     def run(self, num_steps=3000):
         obs, _ = self.env.reset()
 
+        import datetime
+
+        # === NEW: create trajectory folder ===
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.traj_dir = os.path.join(self.base_dir, f"{timestamp}")
+        self.image_dir = os.path.join(self.traj_dir, "images")
+        self.lidar_dir = os.path.join(self.traj_dir, "lidar")
+        self.save_path = os.path.join(self.traj_dir, "locomotion.csv")
+
+        os.makedirs(self.image_dir, exist_ok=True)
+        os.makedirs(self.lidar_dir, exist_ok=True)
+
+        print(f"[INFO] Saving trajectory to: {self.traj_dir}")
+
+
         # ---- initial facing toward +X ----
         scene = self.env.unwrapped.scene
         robot = scene["robot"]
 
-        root_pose = torch.tensor([[0.0, 1.0, 0.65, 1.0, 0.0, 0.0, 0.0]], device=self.device)
+        root_pose = torch.tensor([[2.0, 0.0, 0.65, 1.0, 0.0, 0.0, 0.0]], device=self.device)
         robot.write_root_pose_to_sim(root_pose)
+
+        self.waypoint = self.generate_random_waypoints()
+        print(f"[INFO] Sampled waypoints: {self.waypoint}")
 
         # support multi waypoints
         if isinstance(self.waypoint[0], (float, int)):
@@ -468,16 +600,16 @@ class G1TurningCollector:
                 actions = self.policy(obs)
                 print(f"actions: {actions}")
 
-            idx12 = [0,1,3,4,7,8,11,12,15,16,19,20]
-            action_new = torch.zeros_like(actions)
-            for i,new_i in enumerate(idx12):
-                action_new[:, new_i] = actions[:, new_i]   # 保留这12维
-            print(f"action_new: {action_new}")
+            #idx12 = [0,1,3,4,7,8,11,12,15,16,19,20]
+            #action_new = torch.zeros_like(actions)
+            #for i,new_i in enumerate(idx12):
+                #action_new[:, new_i] = actions[:, new_i]   # 保留这12维
+            #print(f"action_new: {action_new}")
             
-            obs, _, _, _ = self.env.step(action_new)
+            obs, _, _, _ = self.env.step(actions)
 
             # =========================
-            # LIDAR COLLECTION (正确位置)
+            # LIDAR COLLECTION 
             # =========================
             lidar = self.env.unwrapped.scene["lidar"]
 
@@ -487,11 +619,11 @@ class G1TurningCollector:
             # 防 nan
             lidar_np = np.nan_to_num(lidar_np, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # 👉 转 range（推荐）
+            # 转 range（推荐）
             origin = base_pos
             ranges = np.linalg.norm(lidar_np - origin, axis=1)
 
-            # debug（先开）
+            # debug
             print("lidar shape:", lidar_np.shape)
             print("lidar min/max:", ranges.min(), ranges.max())
                 
@@ -535,18 +667,25 @@ class G1TurningCollector:
                     print(f"[DEBUG] Saved frame {step}")
 
                     # -------- LIDAR SAVE --------
+                    '''
                     lidar_dir = os.path.join(self.base_dir, "lidar")
                     os.makedirs(lidar_dir, exist_ok=True)
 
                     np.save(
                         os.path.join(lidar_dir, f"lidar_{step:06d}.npy"),
                         ranges   
+                    )'''
+
+                    np.save(
+                        os.path.join(self.lidar_dir, f"lidar_{step:06d}.npy"),
+                        ranges
                     )
         
         if self.collect_data and writer is not None:
             f.close()
             print(f"[INFO] Dataset saved to: {os.path.abspath(self.save_path)}")
             print(f"[INFO] Images written to: {os.path.abspath(self.image_dir)}")
+            print(f"[INFO] Lidar written to: {os.path.abspath(self.lidar_dir)}")
 
 
 def main():
@@ -556,7 +695,7 @@ def main():
     vx=args_cli.vx,
     vy=args_cli.vy,
     yaw_rate=args_cli.yaw_rate,
-    waypoint=[(0,1),(2.0, 2.0), (4,1),(8,1)], 
+    waypoint=[(0,0),(8,0.0)], 
     img_res=(640, 480),
     save_every=1,
     collect_data=collect_flag,

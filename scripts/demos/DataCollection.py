@@ -74,8 +74,13 @@ class G1TurningCollector:
         env_cfg.curriculum = None
         env_cfg.scene.robot.init_state.rot = (0.0, 0.0, 0.0, 1.0) 
 
-        
-        self._add_obstacle_cube(env_cfg, pos=(2.0, 1.0, 0.25), size=(0.5, 1.0, 0.5),index=0)
+        # --- Add Obstacle if you want ---
+        self._add_obstacle_cube(env_cfg, pos=(0.0, 3.0, 0.25), size=(0.5, 1.0, 0.5),index=0)
+        #self._add_blue_bin(env_cfg, pos=(2, 0, 0.25),index=0)
+        self._add_table(env_cfg, pos=(2, 2, 0.25),index=0)
+
+
+        # --- Add Obstacle if you want ---
         
         
         
@@ -95,9 +100,32 @@ class G1TurningCollector:
 
             offset=CameraCfg.OffsetCfg(
                 pos=(0.3, 0.0, 0.5),
-                rot=(0.0, 0.924, 0.0, 0.383),   # 👈 forward + 42° downward
+                rot=(0.0, 0.924, 0.0, 0.383),   #  forward + 42° downward
                 convention="ros",
             ),
+        )
+
+        # --- Add lidar ---
+        env_cfg.scene.lidar = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/head_link",   
+            update_period=0.05,
+
+            offset=RayCasterCfg.OffsetCfg(
+                pos=(0.0, 0.0, 0.0),
+            ),
+
+            mesh_prim_paths=["/World"],   
+
+            ray_alignment="yaw",
+
+            pattern_cfg=patterns.LidarPatternCfg(
+                channels=32,                      # 垂直线数（先别太大）
+                vertical_fov_range=(-90, 90),
+                horizontal_fov_range=(-180, 180),
+                horizontal_res=2.0,              # 分辨率（deg）
+            ),
+
+            debug_vis=False,
         )
 
         # --- Create environment ---
@@ -135,6 +163,10 @@ class G1TurningCollector:
         self.camera = self.env.unwrapped.scene["camera"]
         print(f"[INFO] Camera initialized. Data collection = {self.collect_data}")
 
+         # --- lidar handle ---
+        self.lidar_dir = os.path.join(self.base_dir, "lidar")
+        os.makedirs(self.lidar_dir, exist_ok=True)
+
 
 
         # --- Add waypoint marker (green sphere) ---
@@ -147,7 +179,7 @@ class G1TurningCollector:
         stage = omni.usd.get_context().get_stage()
 
         scene_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../scene/scene.usd")
+            os.path.join(os.path.dirname(__file__), "../../scene_new/lab.usda")
         )
 
         prim_path = "/World/ExternalScene"
@@ -158,13 +190,15 @@ class G1TurningCollector:
 
         prim = stage.DefinePrim(prim_path, "Xform")
         prim.GetReferences().AddReference(scene_path)
+    
 
-        # ---------- 控制scene transform ----------
+        # ---------- control scene transform ----------
         xform = UsdGeom.Xformable(prim)
 
-        xform.AddTranslateOp().Set(Gf.Vec3f(2, -1, 0))
-        xform.AddRotateZOp().Set(16)     
+        xform.AddTranslateOp().Set(Gf.Vec3f(2, -1, 1.85)) # 2 ，-1
+        xform.AddRotateZOp().Set(50)     
         xform.AddScaleOp().Set(Gf.Vec3f(1, 1, 1))
+        print(xform.GetLocalTransformation())
         # -----------------------------------------
 
         print("[INFO] Scene loaded")
@@ -173,6 +207,9 @@ class G1TurningCollector:
         ground_path = "/World/ground"
         if stage.GetPrimAtPath(ground_path):
             stage.RemovePrim(ground_path)
+
+
+
 
 
     def _add_obstacle_cube(self, env_cfg, pos, size, index):
@@ -211,6 +248,88 @@ class G1TurningCollector:
         )
 
         print(f"[INFO] Added {name} at {pos}")
+
+    def _add_blue_bin(self, env_cfg, pos, index):
+
+        import isaaclab.sim as sim_utils
+        from isaaclab.assets import RigidObjectCfg
+
+        name = f"blue_bin_{index}"
+
+        usd_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../scene_new/blue_bin1.usdz")
+        )
+
+        setattr(
+            env_cfg.scene,
+            name,
+            RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/{name}",
+
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=usd_path,
+
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=True   
+                    ),
+
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        collision_enabled=True
+                    ),
+
+                    scale=(0.75, 0.75, 0.75),
+                ),
+
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=pos,
+                    rot = (0.707, 0, 0, 0.707)  # quaternion (w,x,y,z)
+                ),
+            )
+        )
+
+        print(f"[INFO] Added blue bin at {pos}")
+
+
+    def _add_table(self, env_cfg, pos, index):
+
+        import isaaclab.sim as sim_utils
+        from isaaclab.assets import RigidObjectCfg
+
+        name = f"table_{index}"
+
+        usd_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../scene_new/table1.usdz")
+        )
+
+        setattr(
+            env_cfg.scene,
+            name,
+            RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/{name}",
+
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=usd_path,
+
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=True   
+                    ),
+
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        collision_enabled=True
+                    ),
+
+
+                    scale=(1, 1, 1),
+                ),
+
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=pos,
+                    rot = (1, 0, 0, 0)  # quaternion (w,x,y,z)
+                ),
+            )
+        )
+
+        print(f"[INFO] Added table at {pos}")
     
 
 
@@ -264,7 +383,7 @@ class G1TurningCollector:
         scene = self.env.unwrapped.scene
         robot = scene["robot"]
 
-        root_pose = torch.tensor([[0.0, 1.0, 0.65, 1.0, 0.0, 0.0, 0.0]], device=self.device)
+        root_pose = torch.tensor([[0.0, 0.0, 0.65, 1.0, 0.0, 0.0, 0.0]], device=self.device)
         robot.write_root_pose_to_sim(root_pose)
 
         # support multi waypoints
@@ -281,7 +400,7 @@ class G1TurningCollector:
         yaw_smooth = 0.1
         prev_yaw_rate = 0.0
         current_target_idx = 0
-        threshold_deg = 70
+        threshold_deg = 55
         target = np.array(waypoints[current_target_idx])
 
         prev_yaw = 0.0
@@ -381,7 +500,7 @@ class G1TurningCollector:
 
             else:
                 # 
-                vx_cmd = 0.05
+                vx_cmd = 0.1
                 vy_cmd = 0.0     
                 yaw_smooth = 1.0
 
@@ -420,34 +539,53 @@ class G1TurningCollector:
 
             self.commands = target_cmd.clone()
 
+            self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = self.commands.clone()
+            obs["policy"][0, 11] = self.commands[0, 2]
 
+
+            print(f"obs: {obs}")
+            vec = obs["policy"][0]
+
+            print("base_lin_vel:", vec[0:3])
+            print("base_ang_vel:", vec[3:6])
+            print("proj_gravity:", vec[6:9])
+            print("commands:", vec[9:12])
+            print("joint_pos:", vec[12:49])
+            print("joint_vel:", vec[49:86])
+            print("actions:", vec[86:123])
             # RL policy
             with torch.inference_mode():
                 # write to env
-                self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = self.commands.clone()
-                obs["policy"][0, 11] = self.commands[0, 2]
-
-                print(f"obs: {obs}")
-                vec = obs["policy"][0]
-
-                print("base_lin_vel:", vec[0:3])
-                print("base_ang_vel:", vec[3:6])
-                print("proj_gravity:", vec[6:9])
-                print("commands:", vec[9:12])
-                print("joint_pos:", vec[12:49])
-                print("joint_vel:", vec[49:86])
-                print("actions:", vec[86:123])
-
 
                 actions = self.policy(obs)
                 print(f"actions: {actions}")
 
-                idx12 = [0,1,3,4,7,8,11,12,15,16,19,20]
-                action_new = torch.zeros_like(actions)
-                for i,new_i in enumerate(idx12):
-                    action_new[:, new_i] = actions[:, new_i]   # 保留这12维
-                print(f"action_new: {action_new}")
-                obs, _, _, _ = self.env.step(actions)
+            #idx12 = [0,1,3,4,7,8,11,12,15,16,19,20]
+            #action_new = torch.zeros_like(actions)
+            #for i,new_i in enumerate(idx12):
+                #action_new[:, new_i] = actions[:, new_i]   # 保留这12维
+            #print(f"action_new: {action_new}")
+            
+            obs, _, _, _ = self.env.step(actions)
+
+            # =========================
+            # LIDAR COLLECTION (正确位置)
+            # =========================
+            lidar = self.env.unwrapped.scene["lidar"]
+
+            lidar_points = lidar.data.ray_hits_w[0]   # (N_rays, 3)
+            lidar_np = lidar_points.detach().cpu().numpy()
+
+            # 防 nan
+            lidar_np = np.nan_to_num(lidar_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # 转 range（推荐）
+            origin = base_pos
+            ranges = np.linalg.norm(lidar_np - origin, axis=1)
+
+            # debug（先开）
+            print("lidar shape:", lidar_np.shape)
+            print("lidar min/max:", ranges.min(), ranges.max())
                 
 
             # debug
@@ -471,6 +609,7 @@ class G1TurningCollector:
                 writer.writerow(row.tolist())
 
                 if step % self.save_every == 0:
+                    # -------- Camera SAVE --------
                     rgb_tensor = self.camera.data.output["rgb"][0]
 
                     rgb_np = rgb_tensor[..., :3].cpu().numpy()
@@ -486,6 +625,15 @@ class G1TurningCollector:
                     imageio.imwrite(os.path.join(self.image_dir, f"rgb_{step:06d}.png"), rgb_np)
 
                     print(f"[DEBUG] Saved frame {step}")
+
+                    # -------- LIDAR SAVE --------
+                    lidar_dir = os.path.join(self.base_dir, "lidar")
+                    os.makedirs(lidar_dir, exist_ok=True)
+
+                    np.save(
+                        os.path.join(lidar_dir, f"lidar_{step:06d}.npy"),
+                        ranges   
+                    )
         
         if self.collect_data and writer is not None:
             f.close()
@@ -500,7 +648,7 @@ def main():
     vx=args_cli.vx,
     vy=args_cli.vy,
     yaw_rate=args_cli.yaw_rate,
-    waypoint=[(0,1),(1,1),(2.0, 2.0), (3,1)], 
+    waypoint=[(0,0),(8, 0.0)], 
     img_res=(640, 480),
     save_every=1,
     collect_data=collect_flag,

@@ -11,6 +11,8 @@
 # Scene
 scene/*
 !scene/.gitkeep
+scene_new/*
+!scene_new/.gitkeep
 data/*
 !data/.gitkeep
 
