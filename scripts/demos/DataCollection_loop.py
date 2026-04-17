@@ -1,3 +1,4 @@
+
 """
 Collect G1 locomotion data toward waypoint with shortest yaw rotation.
 - Robot can move in full 2D (vx, vy)
@@ -29,6 +30,38 @@ parser.add_argument("--waypoint_y", type=float, default=1.0, help="Waypoint Y po
 parser.add_argument("--vx", type=float, default=0.5, help="Initial vx command (m/s).")
 parser.add_argument("--vy", type=float, default=0.0, help="Initial vy command (m/s).")
 parser.add_argument("--yaw_rate", type=float, default=0.0, help="Initial yaw rate (rad/s).")
+parser.add_argument(
+    "--lidar_mesh_0",
+    type=str,
+    default="/World/envs/env_0/chair_0/geometry/mesh",
+    help="First mesh prim path for RayCaster lidar_0 (one mesh per Isaac RayCaster).",
+)
+parser.add_argument(
+    "--lidar_mesh_1",
+    type=str,
+    default="/World/envs/env_0/chair_0/geometry/mesh",
+    help="Second mesh prim path for RayCaster lidar_1.",
+)
+parser.add_argument(
+    "--lidar_mesh_paths",
+    type=str,
+    nargs="+",
+    default=None,
+    help="Optional list of mesh prim paths. If set, overrides --lidar_mesh_0/1.",
+)
+parser.add_argument(
+    "--lidar_objects",
+    type=str,
+    nargs="+",
+    default=None,
+    help="Object names like chair_0 table_0; auto-converted to <env_prim_root>/<name>/geometry/mesh.",
+)
+parser.add_argument(
+    "--env_prim_root",
+    type=str,
+    default="/World/envs/env_0",
+    help="Root prim path used when --lidar_objects are provided.",
+)
 args_cli = parser.parse_args()
 
 app_launcher = AppLauncher(args_cli)
@@ -50,10 +83,53 @@ import isaaclab.sim as sim_utils
 from pxr import UsdGeom, Gf, Sdf
 import omni.usd
 
+from data_collection_obstacles import add_chair, add_blue_bin, add_table
+
 ISAACLAB_LEG_IDXS = torch.tensor([
     0, 3, 7, 11, 15, 19,
     1, 4, 8, 12, 16, 20
 ])
+
+
+def _object_to_mesh_path(object_name: str, env_prim_root: str) -> str:
+    """Convert obstacle object name to mesh prim path."""
+    obj_name = object_name.strip()
+    if not obj_name:
+        raise ValueError("Empty object name in --lidar_objects is not allowed.")
+    if obj_name.startswith("/"):
+        return obj_name
+    return f"{env_prim_root.rstrip('/')}/{obj_name}/geometry/mesh"
+
+
+def _merge_ray_hits_multi(
+    origin_np: np.ndarray,
+    hits_list: list[np.ndarray],
+    max_d: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge k (N,3) world hit arrays from sensors with same origin."""
+    if len(hits_list) == 0:
+        raise ValueError("hits_list must contain at least one lidar hit array.")
+
+    diffs = [hits - origin_np for hits in hits_list]
+    ranges_all = [np.linalg.norm(d, axis=1) for d in diffs]
+    finite_all = [
+        np.isfinite(hits).all(axis=1) & (r > 1e-4) & (r < max_d * 0.999)
+        for hits, r in zip(hits_list, ranges_all)
+    ]
+
+    n = hits_list[0].shape[0]
+    merged = np.full_like(diffs[0], np.inf)
+    best_r = np.full(n, np.inf)
+    for diff, r, valid in zip(diffs, ranges_all, finite_all):
+        take = valid & (r < best_r)
+        merged[take] = diff[take]
+        best_r[take] = r[take]
+
+    diff_w = merged
+    ranges = np.linalg.norm(diff_w, axis=1)
+    ranges_xy = np.linalg.norm(diff_w[:, :2], axis=1)
+    return diff_w, ranges, ranges_xy
+
 
 class G1TurningCollector:
     """Collect locomotion data with correct yaw-angle normalization."""
@@ -79,6 +155,37 @@ class G1TurningCollector:
         RL_LIBRARY = "rsl_rl"
         self.collect_data = collect_data
         self.waypoint = np.array(waypoint)
+        # Obstacle center on XY plane (used for region definition).
+        self.obstacle_xy = np.array([2.0, 0.0], dtype=np.float64)
+        # Circular regions: each value is {"center": (2,) xy, "r": radius}.
+        # Only keys listed in ``trajectory_region_sequence`` are sampled each episode.
+        self.trajectory_regions = {
+            "front": {"center": np.array([0.0, 0], dtype=np.float64), "r": 0.5},
+            "front2": {"center": np.array([1.0, 0], dtype=np.float64), "r": 0.5},
+            "back": {"center": np.array([4, 0], dtype=np.float64), "r": 0.3},
+            "left": {"center": np.array([2, 0.5], dtype=np.float64), "r": 0.2},
+            "right": {"center": np.array([2, -0.5], dtype=np.float64), "r": 0.2},
+            # Example extra region (uncomment and add to trajectory_region_sequence to use):
+            # "front2": {"center": np.array([1.0, 0.0], dtype=np.float64), "r": 0.4},
+        }
+        # Episode waypoint order: str = fixed region name; tuple[str, ...] = pick one name at random.
+        # Default matches old behavior: front -> (left or right) -> back.
+        self.trajectory_region_sequence = [
+            "front",
+            "front2",
+            ("left", "right"),
+            "back",
+        ]
+        if args_cli.lidar_objects is not None and len(args_cli.lidar_objects) > 0:
+            mesh_paths = tuple(
+                _object_to_mesh_path(obj_name, args_cli.env_prim_root)
+                for obj_name in args_cli.lidar_objects
+            )
+        elif args_cli.lidar_mesh_paths is not None and len(args_cli.lidar_mesh_paths) > 0:
+            mesh_paths = tuple(args_cli.lidar_mesh_paths)
+        else:
+            mesh_paths = (args_cli.lidar_mesh_0, args_cli.lidar_mesh_1)
+        self._lidar_mesh_paths = mesh_paths
 
         # --- RL config & checkpoint ---
         agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(TASK, args_cli)
@@ -97,13 +204,11 @@ class G1TurningCollector:
         # disable torso-contact termination so collisions with objects don't reset the env
         env_cfg.terminations.base_contact = None ###WE ADDED THIS HERE TO FIX ENV RESET WHEN WE HIT TORSO OF HUMANOID AND OBSTALE
 
-        # --- Add Obstacle below ---
-        # self._add_obstacle_cube(env_cfg, pos=(2, 0.0, 5.25), size=(0.5, 1.0, 0.5),index=0)
-        #self._add_blue_bin(env_cfg, pos=(2, 0, 0.25),index=0)
-        self._add_table(env_cfg, pos=(2, 0, 0.25),index=0)
-
-
-        # --- Add Obstacle above ---
+        # --- Add obstacles (see data_collection_obstacles.py) ---
+        # add_obstacle_cube(env_cfg, pos=(2, 0.0, 5.25), size=(0.5, 1.0, 0.5), index=0)
+        #add_blue_bin(env_cfg, pos=(2, 0, 0.5), index=0)
+        #add_table(env_cfg, pos=(2, 0, 0.5), index=0)
+        add_chair(env_cfg, pos=(2, 0, 0.5), index=0)
         
         env_cfg.scene.robot_contact = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/.*link.*", 
@@ -140,28 +245,25 @@ class G1TurningCollector:
             ),
         )
 
-        # --- Add lidar ---
-        env_cfg.scene.lidar = RayCasterCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/head_link",   
+        _lidar_common = dict(
+            prim_path="{ENV_REGEX_NS}/Robot/head_link",
             update_period=self.lidar_period_s,
-
-            offset=RayCasterCfg.OffsetCfg(
-                pos=(0.0, 0.0, 0.0),
-            ),
-
-            mesh_prim_paths=["/World"],   
-
-            ray_alignment="yaw",
-
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
+            ray_alignment="base",
             pattern_cfg=patterns.LidarPatternCfg(
-                channels=32,                      # 垂直线数（先别太大）
-                vertical_fov_range=(-20, 20),
+                channels=45,
+                vertical_fov_range=(-90, 90),
                 horizontal_fov_range=(-180, 180),
-                horizontal_res=2.0,              # 分辨率（deg）
+                horizontal_res=2.0,
             ),
-
             debug_vis=False,
         )
+        self._lidar_sensor_names = []
+        for i, mesh_path in enumerate(self._lidar_mesh_paths):
+            sensor_name = f"lidar_{i}"
+            setattr(env_cfg.scene, sensor_name, RayCasterCfg(mesh_prim_paths=[mesh_path], **_lidar_common))
+            self._lidar_sensor_names.append(sensor_name)
+            print(f"[INFO] LiDAR mesh path: {sensor_name} -> {mesh_path}")
 
         # --- Create environment ---
         self.env = RslRlVecEnvWrapper(ManagerBasedRLEnv(cfg=env_cfg))
@@ -201,6 +303,8 @@ class G1TurningCollector:
         self.dataset_file = None
         self.contact_file = None
         self.contact_writer = None
+        self._ignored_collision_links = {"left_ankle_roll_link", "right_ankle_roll_link"}
+        self._collision_force_threshold = 0.1
 
         # --- Robot info ---
         robot = self.env.unwrapped.scene["robot"]
@@ -217,8 +321,10 @@ class G1TurningCollector:
         # --- Add waypoint marker (green sphere) ---
         self._add_waypoint_marker()
 
-        # --- Add obstacle cube ---
-        #self._add_obstacle_cube(pos=(2.0, 0.0, 0.5), size=1.0)
+        # --- Obstacles: register before env in __init__ via data_collection_obstacles.add_* ---
+        self._obstacle_names = ("blue_bin_0", "table_0", "chair_0", "obstacle_cube_0")
+        self._obstacle_default_states = {}
+        self._cache_obstacle_default_states()
 
     def _load_scene_usd(self):
         stage = omni.usd.get_context().get_stage()
@@ -253,142 +359,32 @@ class G1TurningCollector:
         if stage.GetPrimAtPath(ground_path):
             stage.RemovePrim(ground_path)
 
+    def _cache_obstacle_default_states(self):
+        """Cache default root states for known obstacles present in the scene."""
+        scene = self.env.unwrapped.scene
+        for name in self._obstacle_names:
+            try:
+                obstacle = scene[name]
+            except KeyError:
+                continue
+            if not hasattr(obstacle, "data") or not hasattr(obstacle.data, "default_root_state"):
+                continue
+            self._obstacle_default_states[name] = obstacle.data.default_root_state.clone()
+            print(f"[INFO] Cached default state for obstacle: {name}")
 
-
-    def _add_obstacle_cube(self, env_cfg, pos, size, index):
-        import isaaclab.sim as sim_utils
-        from isaaclab.assets import RigidObjectCfg
-
-        name = f"obstacle_cube_{index}"
-
-        setattr(
-            env_cfg.scene,
-            name,
-            RigidObjectCfg(
-                prim_path=f"{{ENV_REGEX_NS}}/{name}",
-                spawn=sim_utils.CuboidCfg(
-                    size=size,
-
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    ),
-
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                    physics_material=sim_utils.RigidBodyMaterialCfg(
-                    ),
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=(1.0, 0.0, 0.0)
-                    ),
-                ),
-
-                init_state=RigidObjectCfg.InitialStateCfg(pos=pos),
-            )
-        )
-
-        #print(f"[INFO] Added {name} at {pos}")
-
-    def _add_blue_bin(self, env_cfg, pos, index):
-
-        import isaaclab.sim as sim_utils
-        from isaaclab.assets import RigidObjectCfg
-        from isaaclab.sim.converters import MeshConverterCfg, MeshConverter
-        from isaaclab.sim.schemas import schemas_cfg
-
-        name = f"blue_bin_{index}"
-
-        glb_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../scene_new/blue_bin.glb")
-        )
-
-        usd_dir = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../scene_new/_converted_blue_bin")
-        )
-
-        converter = MeshConverter(MeshConverterCfg(
-            asset_path=glb_path,
-            usd_dir=usd_dir,
-            make_instanceable=True,
-            force_usd_conversion=False,
-            collision_props=sim_utils.CollisionPropertiesCfg(
-            ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-            mesh_collision_props=schemas_cfg.ConvexDecompositionPropertiesCfg(),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            ),
-        ))
-
-        #print(f"[INFO] Converted blue_bin.glb → {converter.usd_path}")
-
-        setattr(
-            env_cfg.scene,
-            name,
-            RigidObjectCfg(
-                prim_path=f"{{ENV_REGEX_NS}}/{name}",
-                spawn=sim_utils.UsdFileCfg(
-                    usd_path=converter.usd_path,
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
-                    scale=(0.65, 0.65, 0.65),
-                ),
-                # Quaternion is (w, x, y, z):
-                # keep upright (original qx90) and rotate heading by 90deg.
-                init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=(0.5, 0.5, 0.5, 0.5)),
-            )
-        )
-        #print(f"[INFO] Added blue bin at {pos}")
-
-
-    def _add_table(self, env_cfg, pos, index):
-
-        import isaaclab.sim as sim_utils
-        from isaaclab.assets import RigidObjectCfg
-        from isaaclab.sim.converters import MeshConverterCfg, MeshConverter
-        from isaaclab.sim.schemas import schemas_cfg
-
-        name = f"table_{index}"
-
-        glb_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../scene_new/table.glb")
-        )
-
-        usd_dir = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../scene_new/_converted_table1")
-        )
-
-        converter = MeshConverter(MeshConverterCfg(
-            asset_path=glb_path,
-            usd_dir=usd_dir,
-            make_instanceable=True,
-            force_usd_conversion=False,
-            collision_props=sim_utils.CollisionPropertiesCfg(
-            ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=4.0),
-            mesh_collision_props=schemas_cfg.ConvexDecompositionPropertiesCfg(),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            ),
-        ))
-
-        #print(f"[INFO] Converted blue_bin.glb → {converter.usd_path}")
-
-        setattr(
-            env_cfg.scene,
-            name,
-            RigidObjectCfg(
-                prim_path=f"{{ENV_REGEX_NS}}/{name}",
-                spawn=sim_utils.UsdFileCfg(
-                    usd_path=converter.usd_path,
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=4.0),
-                    scale=(1, 1, 1),
-                ),
-                init_state=RigidObjectCfg.InitialStateCfg(pos=pos,rot=(0.5, 0.5, 0.5, 0.5)),
-            )
-        )
-        #print(f"[INFO] Added table at {pos}")
-
-
+    def _reset_obstacles_to_default(self):
+        """Restore obstacle pose/velocity to their default root states."""
+        if not self._obstacle_default_states:
+            return
+        scene = self.env.unwrapped.scene
+        for name, default_state in self._obstacle_default_states.items():
+            try:
+                obstacle = scene[name]
+            except KeyError:
+                continue
+            obstacle.write_root_pose_to_sim(default_state[:, :7])
+            if default_state.shape[1] >= 13 and hasattr(obstacle, "write_root_velocity_to_sim"):
+                obstacle.write_root_velocity_to_sim(default_state[:, 7:13])
 
     def _add_waypoint_marker(self):
         """Add green sphere markers for all waypoints."""
@@ -408,6 +404,42 @@ class G1TurningCollector:
             #color_attr = sphere.CreateDisplayColorAttr()
             #color_attr.Set([(0.0, 1.0, 0.0)])  
         print(f"[INFO] Added {len(waypoints)} waypoint markers.")
+
+    def _sample_point_in_region(self, center: np.ndarray, radius: float) -> np.ndarray:
+        """Uniformly sample a point inside a 2D circle."""
+        theta = np.random.uniform(0.0, 2.0 * np.pi)
+        rr = radius * np.sqrt(np.random.uniform(0.0, 1.0))
+        return center + rr * np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
+
+    def _generate_random_waypoint_sequence(self) -> np.ndarray:
+        """Sample one waypoint per entry in ``trajectory_region_sequence`` (see __init__)."""
+        points: list[np.ndarray] = []
+        log_names: list[str] = []
+
+        for entry in self.trajectory_region_sequence:
+            if isinstance(entry, str):
+                region_name = entry
+            elif isinstance(entry, tuple) and len(entry) > 0 and all(isinstance(x, str) for x in entry):
+                region_name = str(np.random.choice(entry))
+            else:
+                raise TypeError(
+                    "trajectory_region_sequence entries must be str or tuple[str, ...], "
+                    f"got {type(entry).__name__}: {entry!r}"
+                )
+
+            if region_name not in self.trajectory_regions:
+                raise KeyError(
+                    f"Region {region_name!r} not in trajectory_regions. "
+                    f"Keys: {list(self.trajectory_regions.keys())}"
+                )
+            cfg = self.trajectory_regions[region_name]
+            pt = self._sample_point_in_region(cfg["center"], float(cfg["r"]))
+            points.append(pt)
+            log_names.append(region_name)
+
+        waypoints = np.stack(points, axis=0)
+        print(f"[INFO] New trajectory waypoints (regions={log_names}): {waypoints}")
+        return waypoints
 
     def _create_new_trajectory_output(self):
         """Create a fresh timestamped folder for one trajectory."""
@@ -429,6 +461,10 @@ class G1TurningCollector:
 
         sensor = self.env.unwrapped.scene["robot_contact"]
         link_names = sensor.body_names
+        self._collision_link_indices = [
+            i for i, name in enumerate(link_names)
+            if name not in self._ignored_collision_links
+        ]
         self.contact_file = open(
             os.path.join(self.base_dir, "contact_force.csv"),
             "w", newline=""
@@ -476,10 +512,14 @@ class G1TurningCollector:
         scene = self.env.unwrapped.scene
         robot = scene["robot"]
 
-        root_pose = torch.tensor([[0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0]], device=self.device)
-        robot.write_root_pose_to_sim(root_pose)
-
+        # Generate waypoints per trajectory (dynamic each reset).
+        self.waypoint = self._generate_random_waypoint_sequence()
         waypoints = self._waypoints_to_list(self.waypoint)
+        start_xy = np.array(waypoints[0], dtype=np.float64)
+        root_pose = torch.tensor([[float(start_xy[0]), float(start_xy[1]), 0.8, 1.0, 0.0, 0.0, 0.0]], device=self.device)
+        robot.write_root_pose_to_sim(root_pose)
+        self._reset_obstacles_to_default()
+        self._add_waypoint_marker()
 
         print(f"[INFO] Running {num_steps} steps through {len(waypoints)} waypoints: {waypoints}")
 
@@ -496,6 +536,7 @@ class G1TurningCollector:
 
         prev_yaw = 0.0
         prev_theta_v = 0.0
+        lidars = [self.env.unwrapped.scene[name] for name in self._lidar_sensor_names]
 
         # --- Data collection ---
         if self.collect_data:
@@ -511,7 +552,10 @@ class G1TurningCollector:
                 [f"torque_{i}" for i in range(N)] +
                 [f"action_{i}" for i in range(N)] +
                 ["vx_cmd", "vy_cmd", "yaw_rate_cmd"] +
-                ["target_x", "target_y"]
+                ["target_x", "target_y"] +
+                ["lidar_min_distance"] +
+                ["lidar_min_distance_xy"] +
+                ["is_collision"]
             )
             writer = self._open_data_writers(header)
 
@@ -547,18 +591,25 @@ class G1TurningCollector:
                     print(f"[INFO] Trajectory #{trajectory_count} completed at global step {step}. Reset to start.")
                     trajectory_count += 1
                     current_target_idx = 0
-                    target = np.array(waypoints[current_target_idx])
-                    self.waypoint = target
 
                     # reset robot/environment state to start the next trajectory
                     obs, _ = self.env.reset()
-                    root_pose = torch.tensor([[0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0]], device=self.device)
+                    self.waypoint = self._generate_random_waypoint_sequence()
+                    waypoints = self._waypoints_to_list(self.waypoint)
+                    target = np.array(waypoints[current_target_idx])
+                    start_xy = np.array(waypoints[0], dtype=np.float64)
+                    root_pose = torch.tensor(
+                        [[float(start_xy[0]), float(start_xy[1]), 0.8, 1.0, 0.0, 0.0, 0.0]],
+                        device=self.device
+                    )
                     robot.write_root_pose_to_sim(root_pose)
+                    self._reset_obstacles_to_default()
                     self.commands[:] = 0.0
                     prev_yaw_rate = 0.0
                     prev_yaw = 0.0
                     prev_theta_v = 0.0
                     trajectory_step = 0
+                    self._add_waypoint_marker()
 
                     if self.collect_data:
                         assert writer is not None
@@ -692,27 +743,37 @@ class G1TurningCollector:
             print(sensor.data.net_forces_w)
 
             # =========================
-            # LIDAR COLLECTION 
+            # LIDAR COLLECTION
             # =========================
-            lidar = self.env.unwrapped.scene["lidar"]
+            lidar_points_list = [lidar.data.ray_hits_w[0].detach().cpu().numpy() for lidar in lidars]
+            origin_np = lidars[0].data.pos_w[0].detach().cpu().numpy()
+            max_d = float(getattr(lidars[0].cfg, "max_distance", 1e6))
 
-            lidar_points = lidar.data.ray_hits_w[0]   # (N_rays, 3)
-            lidar_np = lidar_points.detach().cpu().numpy()
-            lidar_np = np.nan_to_num(lidar_np, nan=0.0, posinf=0.0, neginf=0.0)
+            diff_w, ranges, ranges_xy = _merge_ray_hits_multi(
+                origin_np, lidar_points_list, max_d
+            )
+            finite_hit = np.isfinite(diff_w).all(axis=1)
+            valid_ray = finite_hit & (ranges > 1e-4) & (ranges < max_d * 0.999)
 
+            print(f"lidar merged (first 3 diff): {diff_w[:3]}")
+            print(f"lidar origin_w: {origin_np}, base_pos: {base_pos}")
+            print(f"ranges (first 3): {ranges[:3]}")
 
-            print(f"lidar_np: {lidar_np}")
-            print(f"base pose: {base_pos}")
+            positive_ranges = ranges[valid_ray]
+            lidar_min_range_nonzero_m = (
+                float(np.min(positive_ranges))
+                if positive_ranges.size > 0
+                else float("nan")
+            )
 
-            # 转 range
-            #origin = base_pos
-            #ranges = np.linalg.norm(lidar_np - origin, axis=1)
+            positive_ranges_xy = ranges_xy[valid_ray]
+            lidar_min_range_xy_nonzero_m = (
+                float(np.min(positive_ranges_xy))
+                if positive_ranges_xy.size > 0
+                else float("nan")
+            )
 
-            ranges = np.linalg.norm(lidar_np, axis=1)
-            print(f"ranges: {ranges}")
-
-            # debug 
-            print("lidar shape:", lidar_np.shape)
+            print("lidar shape:", diff_w.shape)
             print("lidar min/max:", ranges.min(), ranges.max())
                 
 
@@ -732,18 +793,30 @@ class G1TurningCollector:
                 commands_np = self.commands[0].detach().cpu().numpy()
                 sim_step = float(trajectory_step)
                 sim_time_s = trajectory_step * self.sim_dt
+                contact = sensor.data.net_forces_w[0].detach().cpu().numpy()
 
                 row = np.concatenate([
                     np.array([sim_step, sim_time_s], dtype=np.float64),
                     base_pos, base_quat, base_lin_vel, base_ang_vel,
-                    joint_pos, joint_vel, torques, actions_np, commands_np, target
+                    joint_pos, joint_vel, torques, actions_np, commands_np, target,
+                    np.array(
+                        [
+                            lidar_min_range_nonzero_m,
+                            lidar_min_range_xy_nonzero_m,
+                            float(
+                                np.any(
+                                    np.abs(contact[self._collision_link_indices, :])
+                                    > self._collision_force_threshold
+                                )
+                            ),
+                        ],
+                        dtype=np.float64,
+                    ),
                 ])
                 writer.writerow(row.tolist())
 
 
                 # ===== CONTACT SAVE =====
-                contact = sensor.data.net_forces_w[0].detach().cpu().numpy()
-
                 contact_row = [step]
                 for i in range(contact.shape[0]):
                     contact_row += contact[i].tolist()
@@ -771,10 +844,11 @@ class G1TurningCollector:
                     self.next_camera_time_s += self.camera_period_s
 
                 # -------- LIDAR SAVE (7 FPS) --------
+                # (N_rays, 3): world-frame hit_w - sensor_origin_w; range = ||diff_w|| per ray.
                 if sim_time_s + 1e-12 >= self.next_lidar_time_s:
                     np.save(
                         os.path.join(self.lidar_dir, f"lidar_{self.lidar_frame_idx:06d}.npy"),
-                        ranges,
+                        diff_w,
                     )
                     self.lidar_frame_idx += 1
                     self.next_lidar_time_s += self.lidar_period_s

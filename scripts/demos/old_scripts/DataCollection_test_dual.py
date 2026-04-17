@@ -1,8 +1,7 @@
-
 """
-Collect G1 locomotion data (same as DataCollection_test.py) with multi RayCasters
-(lidar_0 / lidar_1 / ...), each targeting one mesh prim. Per-ray hits are merged by
-taking the closest valid intersection so CSV / npy match the single-lidar script's shape.
+Collect G1 locomotion data (same as DataCollection_test.py) with two RayCasters
+(lidar_0 / lidar_1), each targeting one mesh prim. Per-ray hits are merged by
+taking the closer valid intersection so CSV / npy match the single-lidar script's shape.
 """
 
 import os
@@ -21,7 +20,7 @@ import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(
-    description="Collect G1 locomotion data with multi LiDAR (one mesh per lidar, merged per ray)."
+    description="Collect G1 locomotion data with dual LiDAR (two mesh_prim_paths, merged per ray)."
 )
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -42,26 +41,6 @@ parser.add_argument(
     type=str,
     default="/World/envs/env_0/chair_0/geometry/mesh",
     help="Second mesh prim path for RayCaster lidar_1.",
-)
-parser.add_argument(
-    "--lidar_mesh_paths",
-    type=str,
-    nargs="+",
-    default=None,
-    help="Optional list of mesh prim paths. If set, overrides --lidar_mesh_0/1 and supports any number of obstacles.",
-)
-parser.add_argument(
-    "--lidar_objects",
-    type=str,
-    nargs="+",
-    default=None,
-    help="Object names like chair_0 table_0; auto-converted to <env_prim_root>/<name>/geometry/mesh.",
-)
-parser.add_argument(
-    "--env_prim_root",
-    type=str,
-    default="/World/envs/env_0",
-    help="Root prim path used when --lidar_objects are provided.",
 )
 args_cli = parser.parse_args()
 
@@ -92,40 +71,33 @@ ISAACLAB_LEG_IDXS = torch.tensor([
 ])
 
 
-def _object_to_mesh_path(object_name: str, env_prim_root: str) -> str:
-    """Convert obstacle object name to mesh prim path."""
-    obj_name = object_name.strip()
-    if not obj_name:
-        raise ValueError("Empty object name in --lidar_objects is not allowed.")
-    if obj_name.startswith("/"):
-        return obj_name
-    return f"{env_prim_root.rstrip('/')}/{obj_name}/geometry/mesh"
-
-
-def _merge_ray_hits_multi(
+def _merge_ray_hits_dual(
     origin_np: np.ndarray,
-    hits_list: list[np.ndarray],
+    hits_a: np.ndarray,
+    hits_b: np.ndarray,
     max_d: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge k (N,3) world hit arrays from sensors with same origin. Returns (diff_w, ranges, ranges_xy)."""
-    if len(hits_list) == 0:
-        raise ValueError("hits_list must contain at least one lidar hit array.")
+    """Merge two (N,3) world hit arrays; same sensor origin. Returns (diff_w, ranges, ranges_xy)."""
+    diff_a = hits_a - origin_np
+    diff_b = hits_b - origin_np
+    r_a = np.linalg.norm(diff_a, axis=1)
+    r_b = np.linalg.norm(diff_b, axis=1)
 
-    diffs = [hits - origin_np for hits in hits_list]
-    ranges_all = [np.linalg.norm(d, axis=1) for d in diffs]
-    finite_all = [
-        np.isfinite(hits).all(axis=1) & (r > 1e-4) & (r < max_d * 0.999)
-        for hits, r in zip(hits_list, ranges_all)
-    ]
+    finite_a = np.isfinite(hits_a).all(axis=1) & (r_a > 1e-4) & (r_a < max_d * 0.999)
+    finite_b = np.isfinite(hits_b).all(axis=1) & (r_b > 1e-4) & (r_b < max_d * 0.999)
 
-    n = hits_list[0].shape[0]
-    merged = np.full_like(diffs[0], np.inf)
-    best_r = np.full(n, np.inf)
-
-    for diff, r, valid in zip(diffs, ranges_all, finite_all):
-        take = valid & (r < best_r)
-        merged[take] = diff[take]
-        best_r[take] = r[take]
+    merged = np.empty_like(diff_a)
+    n = hits_a.shape[0]
+    for i in range(n):
+        va, vb = finite_a[i], finite_b[i]
+        if va and vb:
+            merged[i] = diff_a[i] if r_a[i] <= r_b[i] else diff_b[i]
+        elif va:
+            merged[i] = diff_a[i]
+        elif vb:
+            merged[i] = diff_b[i]
+        else:
+            merged[i] = np.inf
 
     diff_w = merged
     ranges = np.linalg.norm(diff_w, axis=1)
@@ -134,7 +106,7 @@ def _merge_ray_hits_multi(
 
 
 class G1TurningCollectorDual:
-    """Collect locomotion data with multi RayCaster sensors merged per ray."""
+    """Collect locomotion data with dual RayCaster sensors merged per ray."""
 
     @staticmethod
     def _waypoints_to_list(waypoint) -> list:
@@ -155,18 +127,9 @@ class G1TurningCollectorDual:
         self.collect_data = collect_data
         self.waypoint = np.array(waypoint)
 
-        if args_cli.lidar_objects is not None and len(args_cli.lidar_objects) > 0:
-            mesh_paths = tuple(
-                _object_to_mesh_path(obj_name, args_cli.env_prim_root)
-                for obj_name in args_cli.lidar_objects
-            )
-        elif args_cli.lidar_mesh_paths is not None and len(args_cli.lidar_mesh_paths) > 0:
-            mesh_paths = tuple(args_cli.lidar_mesh_paths)
-        else:
-            mesh0 = lidar_mesh_0 if lidar_mesh_0 is not None else args_cli.lidar_mesh_0
-            mesh1 = lidar_mesh_1 if lidar_mesh_1 is not None else args_cli.lidar_mesh_1
-            mesh_paths = (mesh0, mesh1)
-        self._lidar_mesh_paths = mesh_paths
+        mesh0 = lidar_mesh_0 if lidar_mesh_0 is not None else args_cli.lidar_mesh_0
+        mesh1 = lidar_mesh_1 if lidar_mesh_1 is not None else args_cli.lidar_mesh_1
+        self._lidar_mesh_paths = (mesh0, mesh1)
 
         agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(TASK, args_cli)
         checkpoint = get_published_pretrained_checkpoint(RL_LIBRARY, TASK)
@@ -181,14 +144,11 @@ class G1TurningCollectorDual:
 
         env_cfg.terminations.base_contact = None ###WE ADDED THIS HERE TO FIX ENV RESET WHEN WE HIT TORSO OF HUMANOID AND OBSTALE
 
-        # --- Add obstacles below (see data_collection_obstacles.py) ---
+        # --- Add obstacles (see data_collection_obstacles.py) ---
         # add_obstacle_cube(env_cfg, pos=(2, 0.0, 5.25), size=(0.5, 1.0, 0.5), index=0)
-        add_blue_bin(env_cfg, pos=(2, 0, 0.5), index=0)
-        #add_table(env_cfg, pos=(4, 0, 0.5), index=0)
-        #add_chair(env_cfg, pos=(2, 0, 0.5), index=0)
-
-
-        # --- Add obstacles above ---
+        add_blue_bin(env_cfg, pos=(2, 1, 0.25), index=0)
+        #add_table(env_cfg, pos=(2, 0, 0.25), index=0)
+        add_chair(env_cfg, pos=(2, 0, 0.25), index=0)
 
         env_cfg.scene.robot_contact = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/.*link.*",
@@ -235,13 +195,12 @@ class G1TurningCollectorDual:
             debug_vis=False,
         )
 
-        # Isaac RayCaster only allows one mesh per sensor; create one lidar per mesh and merge in Python.
-        self._lidar_sensor_names = []
-        for i, mesh_path in enumerate(self._lidar_mesh_paths):
-            sensor_name = f"lidar_{i}"
-            setattr(env_cfg.scene, sensor_name, RayCasterCfg(mesh_prim_paths=[mesh_path], **_lidar_common))
-            self._lidar_sensor_names.append(sensor_name)
-            print(f"[INFO] LiDAR mesh path: {sensor_name} -> {mesh_path}")
+        # Two RayCasters: Isaac only allows one mesh per sensor; merge hits in Python.
+        env_cfg.scene.lidar_0 = RayCasterCfg(mesh_prim_paths=[mesh0], **_lidar_common)
+        env_cfg.scene.lidar_1 = RayCasterCfg(mesh_prim_paths=[mesh1], **_lidar_common)
+
+        print(f"[INFO] Dual LiDAR mesh paths: lidar_0 → {mesh0}")
+        print(f"[INFO] Dual LiDAR mesh paths: lidar_1 → {mesh1}")
 
         self.env = RslRlVecEnvWrapper(ManagerBasedRLEnv(cfg=env_cfg))
         self.device = self.env.unwrapped.device
@@ -284,8 +243,6 @@ class G1TurningCollectorDual:
 
         self.camera = self.env.unwrapped.scene["camera"]
         print(f"[INFO] Camera initialized. Data collection = {self.collect_data}")
-        self._ignored_collision_links = {"left_ankle_roll_link", "right_ankle_roll_link"}
-        self._collision_force_threshold = 0.1
 
         self._add_waypoint_marker()
 
@@ -352,7 +309,7 @@ class G1TurningCollectorDual:
 
         print(f"[INFO] Running {num_steps} steps through {len(waypoints)} waypoints: {waypoints}")
 
-        stop_thresh = 0.05
+        stop_thresh = 0.1
         k_yaw = 1.0
         max_yaw_rate = 1.0
         yaw_smooth = 0.1
@@ -364,7 +321,8 @@ class G1TurningCollectorDual:
         prev_yaw = 0.0
         prev_theta_v = 0.0
 
-        lidars = [scene[name] for name in self._lidar_sensor_names]
+        lidar0 = scene["lidar_0"]
+        lidar1 = scene["lidar_1"]
 
         if self.collect_data:
             f = open(self.save_path, mode="w", newline="")
@@ -383,17 +341,12 @@ class G1TurningCollectorDual:
                 ["vx_cmd", "vy_cmd", "yaw_rate_cmd"] +
                 ["target_x", "target_y"] +
                 ["lidar_min_distance"] +
-                ["lidar_min_distance_xy"] +
-                ["is_collision"]
+                ["lidar_min_distance_xy"]
             )
             writer.writerow(header)
 
             sensor = self.env.unwrapped.scene["robot_contact"]
             link_names = sensor.body_names
-            self._collision_link_indices = [
-                i for i, name in enumerate(link_names)
-                if name not in self._ignored_collision_links
-            ]
 
             self.contact_file = open(
                 os.path.join(self.base_dir, "contact_force.csv"),
@@ -510,12 +463,13 @@ class G1TurningCollectorDual:
             print(sensor.body_names)
             print(sensor.data.net_forces_w)
 
-            lidar_points_list = [lidar.data.ray_hits_w[0].detach().cpu().numpy() for lidar in lidars]
-            lidar_origin_w = lidars[0].data.pos_w[0].detach().cpu().numpy()
+            lidar_points_0 = lidar0.data.ray_hits_w[0].detach().cpu().numpy()
+            lidar_points_1 = lidar1.data.ray_hits_w[0].detach().cpu().numpy()
+            lidar_origin_w = lidar0.data.pos_w[0].detach().cpu().numpy()
 
-            max_d = float(getattr(lidars[0].cfg, "max_distance", 1e6))
-            diff_w, ranges, ranges_xy = _merge_ray_hits_multi(
-                lidar_origin_w, lidar_points_list, max_d
+            max_d = float(getattr(lidar0.cfg, "max_distance", 1e6))
+            diff_w, ranges, ranges_xy = _merge_ray_hits_dual(
+                lidar_origin_w, lidar_points_0, lidar_points_1, max_d
             )
 
             finite_hit = np.isfinite(diff_w).all(axis=1) & (ranges > 1e-4) & (ranges < max_d * 0.999)
@@ -556,27 +510,19 @@ class G1TurningCollectorDual:
                 commands_np = self.commands[0].detach().cpu().numpy()
                 sim_step = float(step)
                 sim_time_s = step * self.sim_dt
-                contact = sensor.data.net_forces_w[0].detach().cpu().numpy()
 
                 row = np.concatenate([
                     np.array([sim_step, sim_time_s], dtype=np.float64),
                     base_pos, base_quat, base_lin_vel, base_ang_vel,
                     joint_pos, joint_vel, torques, actions_np, commands_np, target,
                     np.array(
-                        [
-                            lidar_min_range_nonzero_m,
-                            lidar_min_range_xy_nonzero_m,
-                            float(
-                                np.any(
-                                    np.abs(contact[self._collision_link_indices, :])
-                                    > self._collision_force_threshold
-                                )
-                            ),
-                        ],
+                        [lidar_min_range_nonzero_m, lidar_min_range_xy_nonzero_m],
                         dtype=np.float64,
                     ),
                 ])
                 writer.writerow(row.tolist())
+
+                contact = sensor.data.net_forces_w[0].detach().cpu().numpy()
 
                 contact_row = [step]
                 for i in range(contact.shape[0]):
@@ -626,7 +572,7 @@ def main():
         vx=args_cli.vx,
         vy=args_cli.vy,
         yaw_rate=args_cli.yaw_rate,
-        waypoint=[(0, 0), (2, 1), (3, 0)],
+        waypoint=[(0, 0), (2, 2), (3, 0)],
         img_res=(640, 480),
         save_every=1,
         collect_data=collect_flag,
